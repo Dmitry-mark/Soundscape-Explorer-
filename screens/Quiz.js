@@ -10,6 +10,8 @@ import {
   Platform,
   Pressable,
   Image,
+  Animated,
+  Easing,
 } from "react-native";
 import { Audio } from "expo-av";
 import { CommonActions } from "@react-navigation/native";
@@ -17,9 +19,9 @@ import { Ionicons } from "@expo/vector-icons";
 
 // Графика
 const bg = require("../assets/fon.png");
-const optionFrame = require("../assets/btn.png");       // рамка вариантов/кнопок
-const audioFrame = require("../assets/Group 8.png");    // рамка плеера
-const backImg   = require("../assets/backward.png");        // <-- фото кнопки "назад"
+const optionFrame = require("../assets/btn.png");
+const audioFrame = require("../assets/Group 8.png");
+const backImg = require("../assets/backward.png");
 
 // ====== ДАННЫЕ КВИЗА ======
 const SOUNDS = {
@@ -55,25 +57,50 @@ const SOUNDS = {
   },
 };
 
-const ALL_KEYS = Object.keys(SOUNDS); // ровно 6
+const ALL_KEYS = Object.keys(SOUNDS);
 
 // helpers
 const pick = (arr, n) => arr.slice().sort(() => Math.random() - 0.5).slice(0, n);
 
+// ====== ВОЛНА ======
+const WAVE_COUNT = 28;
+
+function seededWave(key, count = WAVE_COUNT) {
+  let seed = 0;
+  for (let i = 0; i < key.length; i++) seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
+  const rand = () => {
+    seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+    return ((seed >>> 0) % 1000) / 1000;
+  };
+  const raw = Array.from({ length: count }, () => 0.35 + rand() * 0.65);
+  return raw.map((_, i) => {
+    const a = raw[Math.max(0, i - 1)];
+    const b = raw[i];
+    const c = raw[Math.min(raw.length - 1, i + 1)];
+    return Math.min(1, Math.max(0.2, (a + 2 * b + c) / 4));
+  });
+}
+
 export default function QuizScreen({ navigation }) {
-  // последовательность из 6 уникальных звуков
   const [order, setOrder] = useState(ALL_KEYS.slice().sort(() => Math.random() - 0.5));
-  const [index, setIndex] = useState(0); // 0..5
+  const [index, setIndex] = useState(0);
   const [question, setQuestion] = useState(null);
   const [options, setOptions] = useState([]);
   const [picked, setPicked] = useState(null);
+
   const [isPlaying, setIsPlaying] = useState(false);
-  const [feedback, setFeedback] = useState(""); // Correct! / Wrong!
+  const [progress, setProgress] = useState(0); // 0..1
+  const [wave, setWave] = useState(Array(WAVE_COUNT).fill(0.5));
+
+  const [feedback, setFeedback] = useState("");
   const [score, setScore] = useState(0);
   const [finished, setFinished] = useState(false);
   const soundRef = useRef(null);
 
-  // создать текущий вопрос из order[index]
+  // --- Анимации вариантов ---
+  // на каждый вариант: enter (0..1), pressScale (1), shakeX (0)
+  const animsRef = useRef([]);
+
   const makeQuestion = useCallback(
     (i) => {
       const key = order[i];
@@ -91,11 +118,31 @@ export default function QuizScreen({ navigation }) {
       setOptions(rawOptions);
       setPicked(null);
       setFeedback("");
+      setWave(seededWave(key));
+      setProgress(0);
+
+      // заново поднимем анимации для входа
+      animsRef.current = rawOptions.map(() => ({
+        enter: new Animated.Value(0),
+        press: new Animated.Value(1),
+        shake: new Animated.Value(0),
+      }));
+      // ступенчатое появление
+      Animated.stagger(
+        80,
+        animsRef.current.map((a) =>
+          Animated.spring(a.enter, {
+            toValue: 1,
+            useNativeDriver: true,
+            stiffness: 140,
+            damping: 14,
+          })
+        )
+      ).start();
     },
     [order]
   );
 
-  // старт
   useEffect(() => {
     makeQuestion(0);
     return () => {
@@ -103,39 +150,70 @@ export default function QuizScreen({ navigation }) {
     };
   }, [makeQuestion]);
 
-  // загрузка звука на каждый вопрос
   useEffect(() => {
     (async () => {
       if (!question) return;
       if (soundRef.current) {
-        try { await soundRef.current.stopAsync(); } catch {}
+        try {
+          await soundRef.current.stopAsync();
+        } catch {}
         await soundRef.current.unloadAsync();
       }
       const { sound } = await Audio.Sound.createAsync(question.file, { shouldPlay: false });
       soundRef.current = sound;
       sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded) setIsPlaying(status.isPlaying);
+        if (status.isLoaded) {
+          setIsPlaying(status.isPlaying);
+          const d = status.durationMillis || 0;
+          const p = status.positionMillis || 0;
+          setProgress(d > 0 ? Math.min(p / d, 1) : 0);
+        } else {
+          setProgress(0);
+        }
       });
     })();
   }, [question]);
 
-  // play/pause
   const togglePlay = useCallback(async () => {
     if (!soundRef.current) return;
-    const status = await soundRef.current.getStatusAsync();
-    if (!status.isLoaded) return;
-    if (status.isPlaying) {
-      await soundRef.current.pauseAsync();
-    } else {
-      await soundRef.current.playAsync();
-    }
+    const st = await soundRef.current.getStatusAsync();
+    if (!st.isLoaded) return;
+    if (st.isPlaying) await soundRef.current.pauseAsync();
+    else await soundRef.current.playAsync();
   }, []);
 
-  // выбор ответа
-  const onPick = async (opt) => {
+  // анимированный обработчик нажатия варианта
+  const handlePick = async (opt, idx) => {
     if (picked || finished) return;
-    setPicked(opt.key);
 
+    const anim = animsRef.current[idx];
+    if (anim) {
+      // «тап» (пружина)
+      Animated.sequence([
+        Animated.spring(anim.press, { toValue: 0.94, useNativeDriver: true, stiffness: 250, damping: 18 }),
+        Animated.spring(anim.press, { toValue: 1, useNativeDriver: true, stiffness: 250, damping: 18 }),
+      ]).start();
+
+      // доп. эффект правильный/неправильный
+      if (opt.correct) {
+        // лёгкая пульсация
+        Animated.sequence([
+          Animated.timing(anim.press, { toValue: 1.06, duration: 120, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+          Animated.timing(anim.press, { toValue: 1, duration: 120, easing: Easing.in(Easing.quad), useNativeDriver: true }),
+        ]).start();
+      } else {
+        // «шейк»
+        Animated.sequence([
+          Animated.timing(anim.shake, { toValue: 1, duration: 60, useNativeDriver: true }),
+          Animated.timing(anim.shake, { toValue: -1, duration: 60, useNativeDriver: true }),
+          Animated.timing(anim.shake, { toValue: 1, duration: 60, useNativeDriver: true }),
+          Animated.timing(anim.shake, { toValue: 0, duration: 60, useNativeDriver: true }),
+        ]).start();
+      }
+    }
+
+    // логика ответа
+    setPicked(opt.key);
     const correct = !!opt.correct;
     setFeedback(correct ? "Correct!" : "Wrong!");
     if (correct) setScore((s) => s + 1);
@@ -147,7 +225,6 @@ export default function QuizScreen({ navigation }) {
           if (st.isLoaded && st.isPlaying) await soundRef.current.stopAsync();
         }
       } catch {}
-
       if (index >= 5) {
         setFinished(true);
       } else {
@@ -167,24 +244,20 @@ export default function QuizScreen({ navigation }) {
     setFinished(false);
     makeQuestion(0);
   };
-const goMenu = () => {
-   const ROOT_ROUTE = "StartScreen"; // ← если у тебя 'StartScreen' — замени здесь
-   const action = CommonActions.reset({
-     index: 0,
-     routes: [{ name: ROOT_ROUTE }],
-   });
-   // пробуем сбросить родительский (корневой) навигатор, если есть
-   const parent = navigation.getParent?.();
-   if (parent) parent.dispatch(action);
-   else navigation.dispatch(action);
+  const goMenu = () => {
+    const ROOT_ROUTE = "StartScreen";
+    const action = CommonActions.reset({ index: 0, routes: [{ name: ROOT_ROUTE }] });
+    const parent = navigation.getParent?.();
+    if (parent) parent.dispatch(action);
+    else navigation.dispatch(action);
+    try {
+      navigation.popToTop();
+    } catch {}
+    navigation.navigate(ROOT_ROUTE);
+  };
 
-   // fallback: если имя всё-таки не совпало — просто вверх стека и перейти по имени
-   try { navigation.popToTop(); } catch {}
-   navigation.navigate(ROOT_ROUTE);
- };
-
-  // заглушка заголовка (по ТЗ — пусто)
   const headerTitle = useMemo(() => "", []);
+  const filledBars = Math.floor(progress * WAVE_COUNT);
 
   return (
     <ImageBackground source={bg} style={styles.bg} resizeMode="cover">
@@ -202,20 +275,15 @@ const goMenu = () => {
             <Image source={backImg} style={styles.backImg} resizeMode="contain" />
           </Pressable>
 
-          <Text style={styles.title} numberOfLines={1}>
-            {headerTitle}
-          </Text>
-
+          <Text style={styles.title} numberOfLines={1}>{headerTitle}</Text>
           <View style={{ width: 36 }} />
         </View>
 
-        {/* Если квиз завершён — показываем меню результата */}
+        {/* Если квиз завершён */}
         {finished ? (
           <View style={styles.resultWrap}>
             <Text style={styles.resultTitle}>Your score</Text>
-            <Text style={styles.resultScore}>
-              {score} / 6
-            </Text>
+            <Text style={styles.resultScore}>{score} / 6</Text>
 
             <Pressable onPress={restart} style={({ pressed }) => [styles.resultBtnTouch, pressed && { opacity: 0.9 }]}>
               <ImageBackground source={optionFrame} style={styles.resultBtn} imageStyle={styles.optionImg} resizeMode="stretch">
@@ -231,7 +299,7 @@ const goMenu = () => {
           </View>
         ) : (
           <>
-            {/* Плеер — внутри рамки Group 8 */}
+            {/* Плеер */}
             <View style={styles.playerWrap}>
               <ImageBackground
                 source={audioFrame}
@@ -246,14 +314,23 @@ const goMenu = () => {
                     accessibilityRole="button"
                     accessibilityLabel="Play / Pause"
                   >
-                    {/* Иконку не трогаем — она внутри кнопки */}
                     <Ionicons name={isPlaying ? "pause" : "play"} size={32} color="#fff" />
                   </Pressable>
 
-                  <View style={styles.waveFill}>
-                    {[0.5, 0.7, 0.9, 0.4, 0.8, 0.6].map((h, i) => (
-                      <View key={i} style={[styles.waveBar, { height: `${h * 100}%` }]} />
-                    ))}
+                  {/* Ряд палочек: белые = уже проиграно, золотые = ещё впереди */}
+                  <View style={styles.waveRow}>
+                    {wave.map((h, i) => {
+                      const color = i < filledBars ? "#ffffff" : "#d9a64c";
+                      return (
+                        <View
+                          key={i}
+                          style={[
+                            styles.waveBar,
+                            { height: `${h * 100}%`, backgroundColor: color },
+                          ]}
+                        />
+                      );
+                    })}
                   </View>
                 </View>
               </ImageBackground>
@@ -266,27 +343,47 @@ const goMenu = () => {
               </Text>
             )}
 
-            {/* Варианты — по центру экрана */}
+            {/* Варианты с анимациями */}
             <View style={styles.options}>
-              {options.map((opt) => (
-                <Pressable
-                  key={opt.key}
-                  onPress={() => onPick(opt)}
-                  disabled={!!picked}
-                  style={({ pressed }) => [styles.optionTouch, pressed && { opacity: 0.9 }]}
-                >
-                  <ImageBackground
-                    source={optionFrame}
-                    style={styles.optionFrame}
-                    imageStyle={styles.optionImg}
-                    resizeMode="stretch"
+              {options.map((opt, idx) => {
+                const a = animsRef.current[idx];
+                const translateY = a?.enter.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [16, 0],
+                }) || 0;
+                const translateX = a?.shake.interpolate({
+                  inputRange: [-1, 1],
+                  outputRange: [-8, 8],
+                }) || 0;
+                const scale = a?.press || 1;
+
+                return (
+                  <Pressable
+                    key={opt.key}
+                    onPress={() => handlePick(opt, idx)}
+                    disabled={!!picked}
+                    style={({ pressed }) => [styles.optionTouch, pressed && { opacity: 0.95 }]}
                   >
-                    <Text numberOfLines={2} style={styles.optionText}>
-                      {opt.label}
-                    </Text>
-                  </ImageBackground>
-                </Pressable>
-              ))}
+                    <Animated.View
+                      style={{
+                        transform: [{ translateY }, { translateX }, { scale }],
+                        width: "100%",
+                      }}
+                    >
+                      <ImageBackground
+                        source={optionFrame}
+                        style={styles.optionFrame}
+                        imageStyle={styles.optionImg}
+                        resizeMode="stretch"
+                      >
+                        <Text numberOfLines={2} style={styles.optionText}>
+                          {opt.label}
+                        </Text>
+                      </ImageBackground>
+                    </Animated.View>
+                  </Pressable>
+                );
+              })}
             </View>
           </>
         )}
@@ -315,7 +412,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  backImg: { width: 35, height: 35 }, // картинка стрелки
+  backImg: { width: 35, height: 35 },
   title: {
     flex: 1,
     textAlign: "center",
@@ -334,7 +431,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   audioFrameImg: { borderRadius: 10 },
-
   playerContent: {
     flexDirection: "row",
     alignItems: "center",
@@ -351,19 +447,22 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginLeft: 10,
   },
-  waveFill: {
+
+  // Волна
+  waveRow: {
     flex: 1,
-    height: "45%",
+    height: 28,
+    marginLeft: 10,
+    marginRight: 10,
     flexDirection: "row",
-    paddingLeft: 15,
     alignItems: "center",
-    gap: 6,
+    justifyContent: "space-between",
+    paddingHorizontal: 6,
   },
   waveBar: {
-    flex: 1,
-    maxWidth: 25,
-    backgroundColor: "rgba(255, 214, 130, 0.95)",
+    width: 6,
     borderRadius: 3,
+    opacity: 0.98,
   },
 
   // Результат
@@ -371,7 +470,7 @@ const styles = StyleSheet.create({
   ok: { color: "#B7FF7A" },
   bad: { color: "#FFB5A1" },
 
-  // Центрированные варианты
+  // Варианты
   options: {
     flex: 1,
     gap: 16,
@@ -415,12 +514,7 @@ const styles = StyleSheet.create({
     marginBottom: 18,
   },
   resultBtnTouch: { width: "85%", maxWidth: 420 },
-  resultBtn: {
-    width: "100%",
-    aspectRatio: 3.7,
-    alignItems: "center",
-    justifyContent: "center",
-  },
+  resultBtn: { width: "100%", aspectRatio: 3.7, alignItems: "center", justifyContent: "center" },
   resultBtnText: {
     fontSize: 18,
     fontWeight: "900",
